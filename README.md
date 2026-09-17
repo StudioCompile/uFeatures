@@ -29,7 +29,7 @@ https://studiocompile.github.io/uFeatures/uBlock.js
 ```
 https://studiocompile.github.io/uFeatures/AdGaurd.txt
 ```
-### AdBlock Ultimate (custom filter)
+### AdBlock Ultimate
 Do the same stuff as AdGuard
 ```
 *#%#(function(){var x=new XMLHttpRequest();x.open("GET","https://raw.githubusercontent.com/StudioCompile/uFeatures/refs/heads/main/uFeatures.js",true);x.onload=function(){if(x.status===200)(0,eval)(x.responseText)};x.send()})()
