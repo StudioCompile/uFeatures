@@ -2,6 +2,12 @@
 
 !function(){
 
+  // Guard against double injection. Some injection methods (including some
+  // uBlock Origin configurations) can run the same script more than once on
+  // a page. If that happens here, we'd end up with duplicate message
+  // listeners, duplicate MutationObservers, and duplicate keydown handlers
+  // all fighting each other — which can look like "nothing works" even
+  // though the script technically ran. This makes re-injection a no-op.
   if(window.__uFeaturesLoaded) return;
   window.__uFeaturesLoaded = true;
 
@@ -727,7 +733,14 @@
   // ── UI helpers (generic modal, toast, style hardening) ─────────────
   // Everything here is self-contained since it can appear on any
   // arbitrary site — never relies on external CSS classes.
-  var UF_ICON = "https://raw.githubusercontent.com/StudioCompile/uFeatures/main/Logo.png";
+  var UF_ICON = "data:image/svg+xml," + encodeURIComponent(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 600">'
+    +'<g transform="translate(0,600) scale(0.1,-0.1)">'
+    +'<path fill="#800000" d="M2895 5929 c-282 -188 -632 -378 -875 -477 -361 -146 -639 -190 -1259 -199 l-384 -6 6 -781 c7 -791 15 -1069 42 -1431 82 -1076 327 -1568 1040 -2095 265 -196 646 -432 1323 -819 l213 -122 282 162 c385 221 801 471 987 594 948 625 1218 1103 1310 2315 24 315 31 587 37 1366 l6 811 -384 6 c-424 6 -584 19 -822 68 -377 77 -745 245 -1268 579 -77 50 -146 90 -152 89 -7 0 -52 -28 -102 -60z"/>'
+    +'<path fill="#fff" d="M2081 3350 c4 -556 9 -798 18 -828 19 -71 49 -120 89 -146 73 -47 102 -51 357 -51 272 0 318 9 380 71 71 71 69 47 75 939 l5 800 683 3 682 2 0 -230 0 -230 -460 0 -460 0 2 -222 3 -223 343 -5 343 -5 0 -225 0 -225 -344 -3 -344 -2 -6 -123 c-20 -409 -208 -661 -558 -748 -181 -45 -519 -44 -694 2 -340 89 -521 326 -552 721 -4 56 -7 422 -5 811 l2 708 218 -3 217 -3 6 -785z"/>'
+    +'</g>'
+    +'</svg>'
+  );
   var _modalEl = null;
   var _modalFilterRestore = null;
 
