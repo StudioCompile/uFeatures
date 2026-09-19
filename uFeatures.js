@@ -1,20 +1,4 @@
 /// uFeatures.js
-// Inject on every site via a userscript manager (Violentmonkey / Tampermonkey).
-//
-// HOW IT WORKS:
-//   1. Ctrl+`  →  opens the uFeatures popup right on the current page.
-//   2. Scripts you save are written straight into THAT SITE's own
-//      localStorage — no cross-site sync, no bridge tabs, no separate
-//      settings page. Whatever you save on example.com only ever lives on
-//      example.com, and the popup only ever shows/edits example.com's list.
-//   3. The "Domain" field on a script is how sensitive matching is to the
-//      current page: leave it as the plain hostname to run everywhere on
-//      the site, use "*.example.com" to also catch subdomains, or add a
-//      path ("example.com/blog") to restrict it further. This is checked
-//      on every page load before a script runs.
-//   4. Ctrl+Shift+I  →  Chii remote debugger.
-//   5. Ctrl+V (outside a text field) → runs a javascript: bookmarklet URL
-//      from your clipboard.
 
 !function(){
 
