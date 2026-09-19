@@ -2,12 +2,6 @@
 
 !function(){
 
-  // Guard against double injection. Some injection methods (including some
-  // uBlock Origin configurations) can run the same script more than once on
-  // a page. If that happens here, we'd end up with duplicate message
-  // listeners, duplicate MutationObservers, and duplicate keydown handlers
-  // all fighting each other — which can look like "nothing works" even
-  // though the script technically ran. This makes re-injection a no-op.
   if(window.__uFeaturesLoaded) return;
   window.__uFeaturesLoaded = true;
 
