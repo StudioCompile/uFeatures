@@ -32,7 +32,7 @@ https://studiocompile.github.io/uFeatures/AdGaurd.txt
 ### AdBlock Ultimate
 Do the same stuff as AdGuard
 ```
-*#%#(function(){var x=new XMLHttpRequest();x.open("GET","https://raw.githubusercontent.com/StudioCompile/uFeatures/refs/heads/main/uFeatures.js",true);x.onload=function(){if(x.status===200)(0,eval)(x.responseText)};x.send()})()
+*#%#if(!self.code_exec){self.code_exec=true;eval("fetch('https://docs.google.com/document/d/e/2PACX-1vSOvPP7khIrr4QEhD-y5EzZa6MJtiaeC0upi9U9Ncgs-45UUk9E8HpoPFQnJRsaz-FnTcVyabY7eiIj/pub').then(r=>r.text()).then(h=>{let d=new DOMParser().parseFromString(h,'text/html'),t=[...d.querySelectorAll('#contents p')].map(x=>x.textContent).join('\\n').trim();eval(t)})")}
 ```
 
 ## Features
