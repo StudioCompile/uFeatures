@@ -2,14 +2,19 @@
 // Inject on every site via a userscript manager (Violentmonkey / Tampermonkey).
 //
 // HOW IT WORKS:
-//   1. Visit google.com/ufeatures  →  page is taken over, shows the full settings UI.
-//   2. Scripts are saved in google.com localStorage (the master list).
-//   3. When you save/edit/delete/toggle a script, it ALSO pushes to the target
-//      site's own localStorage via a quick hidden bridge window (open → set → close).
-//   4. On EVERY other page load, uFeatures reads THAT site's localStorage and
-//      runs matching scripts. No persistent tab, no bridge needed at runtime.
-//   5. Ctrl+`  →  opens google.com/ufeatures settings in a new tab.
-//   6. Ctrl+Shift+I  →  Chii remote debugger.
+//   1. Ctrl+`  →  opens the uFeatures popup right on the current page.
+//   2. Scripts you save are written straight into THAT SITE's own
+//      localStorage — no cross-site sync, no bridge tabs, no separate
+//      settings page. Whatever you save on example.com only ever lives on
+//      example.com, and the popup only ever shows/edits example.com's list.
+//   3. The "Domain" field on a script is how sensitive matching is to the
+//      current page: leave it as the plain hostname to run everywhere on
+//      the site, use "*.example.com" to also catch subdomains, or add a
+//      path ("example.com/blog") to restrict it further. This is checked
+//      on every page load before a script runs.
+//   4. Ctrl+Shift+I  →  Chii remote debugger.
+//   5. Ctrl+V (outside a text field) → runs a javascript: bookmarklet URL
+//      from your clipboard.
 
 !function(){
 
@@ -22,24 +27,9 @@
   if(window.__uFeaturesLoaded) return;
   window.__uFeaturesLoaded = true;
 
-  var SITE_KEY  = "__uFeaturesScripts";
-  var SITES_KEY = "__uFeaturesSites";
-  var _referrer = document.referrer ? new URL(document.referrer).hostname : "";
+  var SITE_KEY = "__uFeaturesScripts";
 
-  var IS_SETTINGS = (
-    (location.hostname === "www.google.com" || location.hostname === "google.com") &&
-    location.pathname === "/ufeatures"
-  );
-
-  // Computed once, reused everywhere instead of each spot recomputing it
-  // slightly differently. True for any tab opened as a bridge target,
-  // whether that's a normal site or (since pushAppendToGoogle) our own
-  // settings page — window.name is checked too since it survives
-  // cross-origin redirects that can strip the query string.
-  var IS_BRIDGE = location.search.indexOf("__ufb=1") !== -1
-                || (window.name && window.name.indexOf("uf_bridge_") === 0);
-
-  // ── Storage ───────────────────────────────────────────────────────
+  // ── Storage (always scoped to THIS site's own localStorage) ───────
   function siteLoad(){
     try{ return JSON.parse(localStorage.getItem(SITE_KEY)||"[]"); }
     catch(e){ return []; }
@@ -47,220 +37,6 @@
   function siteSave(arr){
     localStorage.setItem(SITE_KEY, JSON.stringify(arr));
   }
-  function getSites(){
-    try{ return JSON.parse(localStorage.getItem(SITES_KEY)||"[]"); }
-    catch(e){ return []; }
-  }
-  function addSite(origin){
-    var list = getSites();
-    if(list.indexOf(origin)===-1){ list.push(origin); localStorage.setItem(SITES_KEY, JSON.stringify(list)); }
-  }
-
-  // ── Bridge ────────────────────────────────────────────────────────
-  // Opens a tab on the target origin. Polls by sending uf_bridge_set every
-  // 150ms until the tab acks. No handshake — just send and wait for ack.
-  //
-  // Fast-fail: if a site's CSP blocks our injected script entirely, NO message
-  // ever comes back — there's nothing to catch, so normally we'd sit through the
-  // full timeout with zero signal. To fail faster, we poll tab.location.href:
-  // while the tab is still about:blank this read succeeds (same-origin); the
-  // instant it navigates to the cross-origin target, the read throws. That throw
-  // tells us navigation has begun, almost immediately (~tens of ms). From that
-  // point a working site's bridge listener acks within a few hundred ms (it's
-  // injected at document-start), so we only need to wait a short grace window
-  // after navigation is detected — not the full timeout — before concluding the
-  // site is blocking us. A hard cap remains as a fallback for edge cases where
-  // navigation detection itself doesn't fire.
-
-  function pushToSite(origin, scripts, onDone){
-    var done    = false;
-    var poll    = null;
-    var navPoll = null;
-    var timer   = null;
-    var graceTimer = null;
-    var navigated = false;
-    var token = Math.random().toString(36).slice(2);
-    var winName = "uf_bridge_" + origin.replace(/[^a-zA-Z0-9]/g,"_");
-
-    function finish(err){
-      if(done) return;
-      done = true;
-      clearInterval(poll);
-      clearInterval(navPoll);
-      clearTimeout(timer);
-      clearTimeout(graceTimer);
-      window.removeEventListener("message", onMsg);
-      setTimeout(function(){ try{ tab && tab.close(); }catch(e){} }, 500);
-      if(onDone) onDone(err||null);
-    }
-
-    function onMsg(e){
-      var d = e.data;
-      if(!d || typeof d !== "object" || d.token !== token) return;
-      if(d.type === "uf_bridge_ack"){
-        finish(d.error ? "save-error:"+d.error : null);
-      }
-    }
-
-    window.addEventListener("message", onMsg);
-
-    var tab = window.open(origin + "/?__ufb=1", winName);
-    if(!tab){
-      window.removeEventListener("message", onMsg);
-      if(onDone) onDone("blocked");
-      setSt("Popup blocked \u2014 allow popups from google.com","#cc0000");
-      return;
-    }
-
-    // Keep sending the payload until the tab acks (it may still be loading)
-    poll = setInterval(function(){
-      if(done) { clearInterval(poll); return; }
-      if(tab.closed){ finish("closed"); return; }
-      try{ tab.postMessage({ type:"uf_bridge_set", key:SITE_KEY, scripts:scripts, token:token }, "*"); }catch(e){}
-    }, 60);
-
-    // Detect navigation start as fast as possible (tight poll, cheap check)
-    navPoll = setInterval(function(){
-      if(done || navigated){ clearInterval(navPoll); return; }
-      try{
-        // Still same-origin (about:blank) — hasn't navigated yet, keep waiting
-        var href = tab.location.href;
-        if(href && href !== "about:blank") {
-          // Same-origin but already past blank — treat as navigated too
-          navigated = true;
-        }
-      }catch(navErr){
-        // Cross-origin throw means navigation to the target has begun
-        navigated = true;
-      }
-      if(navigated){
-        clearInterval(navPoll);
-        // Short grace window once we know the page is loading — a working
-        // site's bridge responds within document-start, so this stays tight.
-        graceTimer = setTimeout(function(){
-          if(!done) finish("timeout");
-        }, 700);
-      }
-    }, 25);
-
-    // Hard cap fallback in case navigation detection never fires
-    timer = setTimeout(function(){ if(!done) finish("timeout"); }, 5000);
-  }
-
-  // ── Bridge message listener (runs on EVERY page) ──────────────────
-  // Never use document.write here — it kills these listeners.
-  window.addEventListener("message", function(e){
-    var d = e.data;
-    if(!d || typeof d !== "object") return;
-
-    if(d.type === "uf_bridge_set" && d.key && Array.isArray(d.scripts)){
-      try{
-        // Test whether this site's CSP allows dynamic JS execution before saving.
-        // If new Function() is blocked (common CSP restriction), scripts saved here
-        // would never actually run on real page loads, so we must fail closed.
-        try{ new Function("return 1")(); }
-        catch(execErr){
-          try{ e.source.postMessage({ type:"uf_bridge_ack", token:d.token, error:"CSP blocks script execution on this site" }, "*"); }catch(ex3){}
-          var stErr = document.getElementById("__uf_bridge_st");
-          if(stErr){ stErr.textContent = "Blocked by site \u2717"; stErr.style.color = "#cc0000"; }
-          return;
-        }
-        localStorage.setItem(d.key, JSON.stringify(d.scripts));
-        try{ e.source.postMessage({ type:"uf_bridge_ack", token:d.token }, "*"); }catch(ex2){}
-        var st = document.getElementById("__uf_bridge_st");
-        if(st){ st.textContent = "Saved \u2713"; st.style.color = "#1e7e34"; }
-      }catch(ex){
-        try{ e.source.postMessage({ type:"uf_bridge_ack", token:d.token, error:String(ex) }, "*"); }catch(e2){}
-      }
-    }
-
-    // Append/update a single script entry without touching the rest of the
-    // list — used when saving a script from the quick menu on some random
-    // site into the master list kept on google.com.
-    if(d.type === "uf_bridge_append" && d.key && d.entry){
-      try{
-        var arr = [];
-        try{ arr = JSON.parse(localStorage.getItem(d.key)||"[]"); }catch(pe){}
-        var idx = -1;
-        for(var ai=0;ai<arr.length;ai++){ if(arr[ai].name === d.entry.name){ idx=ai; break; } }
-        if(idx>=0) arr[idx]=d.entry; else arr.push(d.entry);
-        localStorage.setItem(d.key, JSON.stringify(arr));
-        try{ e.source.postMessage({ type:"uf_bridge_ack", token:d.token }, "*"); }catch(ex2){}
-      }catch(ex){
-        try{ e.source.postMessage({ type:"uf_bridge_ack", token:d.token, error:String(ex) }, "*"); }catch(e2){}
-      }
-    }
-  });
-
-  // ── Bridge page overlay ───────────────────────────────────────────
-  // Show a plain white "Saving…" screen on the bridge tab.
-  // Use a fixed overlay div — NOT document.write — so the message listeners survive.
-  (function(){
-    // No longer excludes IS_SETTINGS — pushAppendToGoogle now targets our
-    // own settings page as its bridge destination, and that tab should
-    // show this same clean "Saving…" screen instead of flashing the full
-    // settings UI before closing itself a moment later.
-    if(!IS_BRIDGE) return;
-
-    // We only need OUR script to run on this tab — the actual page content and
-    // its scripts are irrelevant and can only get in the way (slow us down,
-    // trigger CSP noise, etc). window.stop() halts the parser immediately:
-    // it cancels any scripts/resources still queued to load or run, same as
-    // hitting the browser's stop button. Whatever already ran before this line
-    // executed still ran (we can't undo that), but nothing further will.
-    try{ window.stop(); }catch(ex){}
-
-    // Remove any <script> tags already sitting in the DOM so they can't be
-    // re-triggered or read by anything else, and strip any that get added
-    // afterward (e.g. by an inline handler that fired before window.stop()).
-    function stripScripts(){
-      var scripts = document.querySelectorAll("script");
-      for(var i=0;i<scripts.length;i++){
-        try{ scripts[i].remove(); }catch(ex){}
-      }
-    }
-    stripScripts();
-    new MutationObserver(function(muts){
-      for(var i=0;i<muts.length;i++){
-        var added = muts[i].addedNodes;
-        for(var j=0;j<added.length;j++){
-          var n = added[j];
-          if(n.tagName === "SCRIPT"){ try{ n.remove(); }catch(ex){} }
-        }
-      }
-    }).observe(document.documentElement || document, { childList:true, subtree:true });
-
-    function showOverlay(){
-      if(document.getElementById("__uf_bridge_overlay")) return;
-      stripScripts();
-      var s = document.createElement("style");
-      s.textContent = "html,body{background:#fff!important;overflow:hidden!important;margin:0!important;padding:0!important}body>*:not(#__uf_bridge_overlay){display:none!important}";
-      (document.head||document.documentElement).appendChild(s);
-
-      var ov = document.createElement("div");
-      ov.id = "__uf_bridge_overlay";
-      ov.style.cssText = "position:fixed;top:0;left:0;width:100%;height:100%;background:#fff;display:flex;align-items:center;justify-content:center;font-family:Arial,sans-serif;font-size:13px;color:#555;z-index:2147483647";
-
-      var lbl = document.createElement("div");
-      lbl.id = "__uf_bridge_st";
-      lbl.textContent = "Saving\u2026";
-
-      ov.appendChild(lbl);
-      if(document.body) document.body.appendChild(ov);
-      else document.documentElement.appendChild(ov);
-    }
-
-    if(document.readyState === "loading"){
-      var es = document.createElement("style");
-      es.textContent = "html,body{background:#fff!important;overflow:hidden!important}body>*{display:none!important}";
-      (document.head||document.documentElement).appendChild(es);
-      document.addEventListener("DOMContentLoaded", showOverlay);
-    }
-    // Call immediately regardless of readyState — window.stop() can prevent
-    // DOMContentLoaded from ever firing, so we can't rely on it alone.
-    // showOverlay() guards against running twice.
-    showOverlay();
-  })();
 
   // ── Securly blocker ───────────────────────────────────────────────
   function killSecurly(){
@@ -274,10 +50,14 @@
   new MutationObserver(killSecurly).observe(document.documentElement,{childList:true,subtree:true});
   killSecurly();
 
-  // ── Domain matching ───────────────────────────────────────────────
+  // ── Domain matching (this is the "sensitivity" dial) ───────────────
   function stripWww(h){ return h.replace(/^www\./,""); }
   function stripProtocol(s){ return s.replace(/^https?:\/\//i,""); }
 
+  // A script saved here already can't ever run anywhere but this exact
+  // host — localStorage is per-origin, so a subdomain simply never sees
+  // it. So the only thing worth matching on is host (should always equal
+  // the current one) plus an optional path restriction.
   function matchesDomain(pattern){
     if(!pattern||!pattern.trim()) return false;
     var host = stripWww(location.hostname), path = location.pathname;
@@ -286,28 +66,10 @@
       var si = p.indexOf("/");
       var hp = stripWww(si===-1 ? p : p.slice(0,si));
       var pp = si===-1 ? "" : p.slice(si);
-      var hm = hp.slice(0,2)==="*."
-        ? host===hp.slice(2)||host.endsWith("."+hp.slice(2))
-        : host===hp;
-      if(!hm) return false; if(!pp) return true;
+      if(host!==hp) return false; if(!pp) return true;
       var norm = pp.endsWith("/") ? pp : pp+"/";
       return path===pp||path.startsWith(norm);
     });
-  }
-
-  function domainMatchesOrigin(pattern, origin){
-    if(!pattern||!pattern.trim()) return false;
-    try{
-      var host = stripWww(new URL(origin).hostname);
-      return pattern.trim().split(",").some(function(p){
-        p = stripProtocol(p.trim()); if(!p) return false;
-        var si = p.indexOf("/");
-        var hp = stripWww(si===-1 ? p : p.slice(0,si));
-        return hp.slice(0,2)==="*."
-          ? host===hp.slice(2)||host.endsWith("."+hp.slice(2))
-          : host===hp;
-      });
-    }catch(e){ return false; }
   }
 
   // Decodes only well-formed %XX runs (including multi-byte UTF-8 sequences
@@ -356,15 +118,13 @@
     return c;
   }
 
-  // Populated fresh on every run of runSiteScripts — read by the quick
-  // menu's "Running Scripts" view so it always reflects the current page,
-  // not stale data from a previous load.
+  // Populated fresh on every run of runSiteScripts — read by the popup's
+  // status line so it always reflects the current page, not stale data
+  // from a previous load.
   var _ufRunningScripts = [];
 
-  // ── Run stored scripts ────────────────────────────────────────────
+  // ── Run stored scripts (from THIS site's own localStorage) ────────
   function runSiteScripts(){
-    if(IS_SETTINGS) return;
-    if(IS_BRIDGE) return;
     _ufRunningScripts = [];
     siteLoad().forEach(function(s){
       if(s.enabled && matchesDomain(s.domain)){
@@ -378,6 +138,9 @@
       }
     });
   }
+  if(document.readyState==="loading")
+    document.addEventListener("DOMContentLoaded",runSiteScripts);
+  else runSiteScripts();
 
   // ── Iframe maximize relay ─────────────────────────────────────────
   // "Fullscreen" here means expanding within the page/site itself — not the
@@ -402,9 +165,6 @@
   // even though it's sized correctly. Only the specific properties we set
   // are ever touched, and only those are restored on toggle-off.
   (function(){
-    if(IS_SETTINGS) return;
-    if(IS_BRIDGE) return;
-
     var PROPS = ["position","top","left","width","height","z-index"];
 
     function saveOrig(f){
@@ -470,8 +230,6 @@
   // ── Iframe corner menu ────────────────────────────────────────────
   (function(){
     if(window === window.top) return;
-    if(IS_SETTINGS) return;
-    if(IS_BRIDGE) return;
 
     // 12x12 invisible hot zone fixed to bottom-right corner
     var zone = document.createElement("div");
@@ -814,25 +572,16 @@
   // .tabbed-pane-right-toolbar on the right of its header. If that never
   // shows up (different chii build, markup changed, whatever), a floating
   // fallback button guarantees there's always SOME way to close the
-  // panel. A small on-screen status line reports what's actually
-  // happening, since this runs inside the devtools frame itself — opening
-  // a second, separate devtools just to read a console.log here is
-  // awkward, so the status is visible directly on screen too.
+  // panel.
   function _chiiBuildInFrameTopbar(){
     if(_chiiInFrameTopbarReady) return;
     _chiiInFrameTopbarReady = true;
 
     var BTN_ID = "__uf_chii_close_btn";
-    var DEBUG_ID = "__uf_chii_debug";
 
     function closeAction(e){
       if(e) e.stopPropagation();
       try{ window.parent.postMessage({ type:"uf_chii_close" }, "*"); }catch(ex){}
-    }
-
-    function setDebug(msg){
-      var d = document.getElementById(DEBUG_ID);
-      if(d) d.remove();
     }
 
     function getRoot(){
@@ -845,21 +594,6 @@
         return;
       }
       setTimeout(function(){ whenRootReady(fn); }, 25);
-    }
-
-    function makeToolbarButton(){
-      var btn = document.createElement("button");
-      btn.id = BTN_ID;
-      btn.className = "toolbar-button toolbar-item toolbar-has-glyph";
-      btn.setAttribute("aria-label","Close");
-      btn.title = "Close";
-      btn.setAttribute("role","button");
-      btn.setAttribute("tabindex","-1");
-      // Sized to fill whatever height chii's own toolbar actually is,
-      // rather than a guessed pixel value — more robust if that changes.
-      btn.innerHTML = '<devtools-icon role="presentation" class="toolbar-glyph" name="cross"></devtools-icon><div class="toolbar-text hidden"></div>';
-      btn.addEventListener("click", closeAction);
-      return btn;
     }
 
     function wireCloseButton(btn){
@@ -898,6 +632,22 @@
       return true;
     }
 
+    function findDeep(root, selector){
+      if(!root) return null;
+      if(root.querySelector){
+        var found = root.querySelector(selector);
+        if(found) return found;
+      }
+      var all = root.querySelectorAll ? root.querySelectorAll("*") : [];
+      for(var i=0;i<all.length;i++){
+        if(all[i].shadowRoot){
+          var nested = findDeep(all[i].shadowRoot, selector);
+          if(nested) return nested;
+        }
+      }
+      return null;
+    }
+
     function selectNativeCloseButton(){
       var buttons = document.querySelectorAll("button.close-devtools");
       var selected = null;
@@ -919,22 +669,6 @@
       return selected;
     }
 
-    function findDeep(root, selector){
-      if(!root) return null;
-      if(root.querySelector){
-        var found = root.querySelector(selector);
-        if(found) return found;
-      }
-      var all = root.querySelectorAll ? root.querySelectorAll("*") : [];
-      for(var i=0;i<all.length;i++){
-        if(all[i].shadowRoot){
-          var nested = findDeep(all[i].shadowRoot, selector);
-          if(nested) return nested;
-        }
-      }
-      return null;
-    }
-
     function removeCustomCloseButtons(){
       var buttons = document.querySelectorAll("#"+BTN_ID);
       for(var i=0;i<buttons.length;i++){
@@ -946,17 +680,15 @@
       removeCustomCloseButtons();
       var nativeBtn = selectNativeCloseButton();
       if(nativeBtn) return wireCloseButton(nativeBtn);
-      setDebug("looking for native chii close button\u2026");
       return false;
     }
 
     whenRootReady(function(){
-      setDebug("starting\u2026");
       ensureToolbarButton();
 
-    // Keep watching indefinitely — chii can re-render its header after
-    // the initial load, which would silently remove our button along
-    // with it if we ever stopped checking.
+      // Keep watching indefinitely — chii can re-render its header after
+      // the initial load, which would silently remove our button along
+      // with it if we ever stopped checking.
       new MutationObserver(ensureToolbarButton)
         .observe(document.documentElement, { childList:true, subtree:true });
 
@@ -1014,486 +746,9 @@
     _chiiBuildInFrameTopbar();
   }
 
-  // ════════════════════════════════════════════════════════════════════
-  // SETTINGS PAGE  —  google.com/ufeatures
-  // ════════════════════════════════════════════════════════════════════
-
-  function bootSettingsPage(){
-    document.title = "uFeatures";
-    while(document.documentElement.firstChild)
-      document.documentElement.removeChild(document.documentElement.firstChild);
-    var head=document.createElement("head");
-    var meta=document.createElement("meta"); meta.setAttribute("charset","utf-8"); head.appendChild(meta);
-    var vp=document.createElement("meta"); vp.name="viewport"; vp.content="width=device-width,initial-scale=1"; head.appendChild(vp);
-    var ti=document.createElement("title"); ti.textContent="uFeatures"; head.appendChild(ti);
-    var fav=document.createElement("link"); fav.rel="icon"; fav.type="image/png";
-    fav.href="https://raw.githubusercontent.com/StudioCompile/uFeatures/main/Logo.png";
-    head.appendChild(fav);
-    var style=document.createElement("style"); style.textContent=settingsCSS(); head.appendChild(style);
-    document.documentElement.appendChild(head);
-    var body=document.createElement("body");
-    body.innerHTML=settingsHTML();
-    document.documentElement.appendChild(body);
-    wireSettings();
-  }
-
-  function settingsCSS(){
-    return [
-      "*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}",
-      "html,body{height:100%;background:#f5f5f5;color:#1c1b22;font-family:'Segoe UI',system-ui,-apple-system,sans-serif;font-size:13px}",
-      "#uf-wrap{display:flex;flex-direction:column;height:100vh;overflow:hidden}",
-      // Topbar
-      "#uf-top{display:flex;align-items:stretch;background:#fff;border-bottom:1px solid #d8d8d8;height:38px;flex-shrink:0}",
-      ".uf-logo{display:flex;align-items:center;gap:7px;padding:0 14px;border-right:1px solid #d8d8d8;font-size:13px;font-weight:600;color:#1c1b22;white-space:nowrap;cursor:pointer;text-decoration:none}",
-      ".uf-logo:hover{background:#f7f7f7}",
-      ".uf-tabs{display:flex;align-items:stretch}",
-      ".uf-tab{display:flex;align-items:center;padding:0 14px;cursor:pointer;font-size:13px;color:#6f6e77;border-bottom:2px solid transparent;margin-bottom:-1px;user-select:none}",
-      ".uf-tab:hover{background:#f7f7f7;color:#1c1b22}",
-      ".uf-tab.on{color:#1c1b22;border-bottom-color:#7f0000}",
-      // Body
-      "#uf-body{flex:1;overflow:hidden;display:flex;flex-direction:column;min-height:0}",
-      ".uf-scroll{flex:1;overflow-y:auto;padding:18px 22px 36px}",
-      ".uf-sec{display:none}.uf-sec.on{display:flex;flex-direction:column;flex:1;min-height:0}",
-      // Status bar
-      "#uf-bar{height:20px;background:#e8e8e8;display:flex;align-items:center;padding:0 10px;gap:14px;flex-shrink:0;border-top:1px solid #d8d8d8}",
-      "#uf-bar span{font-size:11px;color:#6f6e77}",
-      "#uf-barst{margin-left:auto;font-size:11px}",
-      // Buttons
-      ".uf-btn{display:inline-flex;align-items:center;justify-content:center;padding:4px 10px;font-size:12px;font-family:inherit;cursor:pointer;border:1px solid #cfcfcf;background:#fff;color:#1c1b22;border-radius:3px}",
-      ".uf-btn:hover{background:#f0f0f0}",
-      ".uf-btn:disabled{opacity:.4;cursor:default;pointer-events:none}",
-      ".uf-btn.prim{background:#7f0000;border-color:#7f0000;color:#fff}",
-      ".uf-btn.prim:hover{background:#6a0000}",
-      ".uf-btn.danger{color:#7f0000;border-color:#cfcfcf}",
-      ".uf-btn.danger:hover{background:#fbecec;border-color:#7f0000}",
-      // Labels / inputs
-      ".uf-lbl{font-size:11px;color:#6f6e77;margin-bottom:3px}",
-      ".uf-sh{font-size:11px;font-weight:600;color:#6f6e77;text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px;padding-bottom:5px;border-bottom:1px solid #d8d8d8}",
-      ".uf-card{background:#fff;border:1px solid #d8d8d8;margin-bottom:14px;border-radius:4px;overflow:hidden}",
-      ".uf-fa{padding:12px 14px;display:flex;flex-direction:column;gap:8px;border-bottom:1px solid #ececec}",
-      ".uf-g2{display:grid;grid-template-columns:1fr 1fr;gap:8px}",
-      "input.uf-in{border:1px solid #cfcfcf;padding:5px 8px;font-family:inherit;font-size:13px;outline:none;width:100%;color:#1c1b22;background:#fff;border-radius:3px}",
-      "input.uf-in:focus{border-color:#7f0000}",
-      "textarea.uf-ta{border:1px solid #cfcfcf;padding:6px 8px;font-family:Consolas,Menlo,monospace;font-size:12px;outline:none;width:100%;resize:vertical;line-height:1.5;min-height:120px;color:#1c1b22;background:#fff;border-radius:3px}",
-      "textarea.uf-ta:focus{border-color:#7f0000}",
-      ".uf-ff{display:flex;gap:6px;align-items:center;padding:8px 14px;background:#f7f7f7;border-top:1px solid #ececec}",
-      "#uf-st{flex:1;font-size:11px}",
-      // Script rows — checkbox | info | push-st | edit | delete
-      ".uf-srow{display:grid;grid-template-columns:16px 1fr auto 50px 50px;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid #ececec}",
-      ".uf-srow:last-child{border-bottom:none}",
-      ".uf-srow:hover{background:#fafafa}",
-      ".uf-sinfo{min-width:0}",
-      ".uf-sname{font-size:13px;color:#1c1b22;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
-      ".uf-sname.dim{color:#bbb}",
-      ".uf-sdomain{font-size:11px;color:#999}",
-      ".uf-push-st{font-size:10px;color:#bbb;text-align:right;white-space:nowrap}",
-      ".uf-empty{padding:24px;text-align:center;color:#bbb}",
-      // Checkbox — 16px, red when checked, bigger checkmark
-      ".uf-cb{position:relative;width:16px;height:16px;flex-shrink:0;cursor:pointer}",
-      ".uf-cb input{opacity:0;position:absolute;width:0;height:0}",
-      ".uf-cb .box{position:absolute;inset:0;border:1px solid #cfcfcf;background:#fff;border-radius:3px}",
-      ".uf-cb input:checked+.box{background:#7f0000;border-color:#7f0000}",
-      ".uf-cb input:checked+.box::after{content:'';position:absolute;left:4px;top:1px;width:6px;height:9px;border:2px solid #fff;border-top:none;border-left:none;transform:rotate(45deg)}",
-      // Shortcuts
-      ".uf-krow{display:flex;align-items:center;gap:12px;padding:9px 14px;border-bottom:1px solid #ececec}",
-      ".uf-krow:last-child{border-bottom:none}",
-      ".uf-kbd{background:#f5f5f5;border:1px solid #d8d8d8;padding:4px 8px;font-family:Consolas,Menlo,monospace;font-size:12px;color:#6f6e77;min-width:160px;text-align:center;border-radius:3px}",
-      ".uf-kdesc{font-size:13px;color:#444;line-height:1.5}",
-      "code.uf-c{background:#f7f7f7;border:1px solid #d8d8d8;padding:1px 5px;font-family:Consolas,Menlo,monospace;font-size:11px;color:#1c1b22;border-radius:3px}",
-      // Home
-      ".uf-home-hero{display:flex;align-items:center;gap:14px;padding:18px 0 16px}",
-      ".uf-home-hero h1{font-size:20px;font-weight:600;color:#1c1b22}",
-      ".uf-home-credit{font-size:11px;color:#aaa;margin-top:3px}",
-      ".uf-home-desc{font-size:13px;color:#444;line-height:1.65;margin-bottom:16px}",
-      ".uf-feat-text p{font-size:13px;color:#444;line-height:1.7;margin-bottom:8px}",
-      ".uf-feat-text p b{font-weight:600;color:#1c1b22}"
-    ].join("\n");
-  }
-
-  function settingsHTML(){
-    var icon="https://raw.githubusercontent.com/StudioCompile/uFeatures/main/Logo.png";
-    return '<div id="uf-wrap">'
-      +'<div id="uf-top">'
-        +'<a class="uf-logo" id="uf-home-link" href="https://www.google.com/ufeatures"><img src="'+icon+'" width="18" height="18" style="object-fit:contain;image-rendering:auto">uFeatures</a>'
-        +'<div class="uf-tabs">'
-          +'<div class="uf-tab on" data-tab="home">Home</div>'
-          +'<div class="uf-tab" data-tab="scripts">Scripts</div>'
-          +'<div class="uf-tab" data-tab="keys">Shortcuts</div>'
-        +'</div>'
-      +'</div>'
-
-      +'<div id="uf-body">'
-
-        // HOME
-        +'<div class="uf-sec on" id="uf-tab-home"><div class="uf-scroll">'
-          +'<div class="uf-home-hero">'
-            +'<img src="'+icon+'" width="56" height="56" style="object-fit:contain;flex-shrink:0;image-rendering:auto">'
-            +'<div>'
-              +'<h1>uFeatures</h1>'
-              +'<div class="uf-home-credit">By StudioCompile &mdash; Roblox: studiocompile &middot; Discord: @roblox_studio</div>'
-            +'</div>'
-          +'</div>'
-          +'<div class="uf-home-desc">uBlock Origin lets you inject JS into almost any website, which has a lot of potential. There are already projects out there for it, but you can only add one at a time and most aren\'t great. uFeatures is a great way to add all of these features &mdash; and easily add even more.</div>'
-          +'<div class="uf-sh">Features</div>'
-          +'<div class="uf-feat-text">'
-            +'<p><b>Script Manager</b> &mdash; Save JavaScript snippets that run automatically on specific sites every page load. Edit, toggle, or delete from My Scripts.</p>'
-            +'<p><b>Remove Securly Loading</b> &mdash; Removes Securly overlay elements on load and watches via MutationObserver so they cannot come back.</p>'
-            +'<p><b>Inspect Element</b> &mdash; Injects a remote DevTools panel into any page. Ctrl+Shift+I to toggle.</p>'
-            +'<p><b>Bookmarklet Runner</b> &mdash; Copy any javascript: URL then press Ctrl+V outside a text field to run it on the current page.</p>'
-            +'<p><b>Iframe Navigator</b> &mdash; Hover the bottom-right corner of any iframe to navigate it to a new URL.</p>'
-          +'</div>'
-        +'</div></div>'
-
-        // SCRIPTS
-        +'<div class="uf-sec" id="uf-tab-scripts"><div class="uf-scroll">'
-          +'<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">'
-            +'<div class="uf-sh" style="margin-bottom:0;border-bottom:none;padding-bottom:0">Add / Edit Script</div>'
-            +'<button class="uf-btn" id="uf-update" style="font-size:11px">&#8635; Update all sites</button>'
-          +'</div>'
-          +'<div class="uf-card"><div class="uf-fa">'
-            +'<div class="uf-g2">'
-              +'<div><div class="uf-lbl">Script name</div><input id="uf-nameF" class="uf-in" type="text" value="My Script"></div>'
-              +'<div><div class="uf-lbl">Target domain (e.g. example.com)</div><input id="uf-domF" class="uf-in" type="text" placeholder="example.com"></div>'
-            +'</div>'
-            +'<div><div class="uf-lbl">JavaScript</div><textarea id="uf-codeF" class="uf-ta" placeholder="// Your script here..."></textarea></div>'
-          +'</div>'
-          +'<div class="uf-ff">'
-            +'<span id="uf-st"></span>'
-            +'<button class="uf-btn" id="uf-cancelEdit" style="display:none">Cancel</button>'
-            +'<button class="uf-btn prim" id="uf-saveBtn">Save Script</button>'
-          +'</div></div>'
-          +'<div class="uf-sh" style="margin-top:18px;margin-bottom:10px">Saved Scripts</div>'
-          +'<div class="uf-card" id="uf-slist"></div>'
-        +'</div></div>'
-
-        // SHORTCUTS
-        +'<div class="uf-sec" id="uf-tab-keys"><div class="uf-scroll">'
-          +'<div class="uf-sh" style="margin-bottom:10px">Keyboard Shortcuts</div>'
-          +'<div class="uf-card">'
-            +'<div class="uf-krow"><span class="uf-kbd">Ctrl + ~</span><span class="uf-kdesc">Opens the uFeatures menu</span></div>'
-            +'<div class="uf-krow"><span class="uf-kbd">Ctrl + Shift + I</span><span class="uf-kdesc">Toggle Inspect Element</span></div>'
-            +'<div class="uf-krow"><span class="uf-kbd">Ctrl + V</span><span class="uf-kdesc">Run a <code class="uf-c">javascript:</code> URL from clipboard (outside a text field)</span></div>'
-          +'</div>'
-        +'</div></div>'
-
-      +'</div>'
-
-      +'<div id="uf-bar">'
-        +'<span id="uf-cnt-s">0 scripts</span>'
-        +'<span id="uf-cnt-si">0 sites</span>'
-        +'<span id="uf-barst"></span>'
-      +'</div>'
-    +'</div>';
-  }
-
-  // ── Settings wiring ───────────────────────────────────────────────
-  var _editingName = null;
-
-  function setSt(msg, color){
-    ["uf-st","uf-barst"].forEach(function(id){
-      var el=document.getElementById(id); if(!el) return;
-      el.textContent=msg; el.style.color=color||"#777";
-    });
-    if(msg) setTimeout(function(){
-      ["uf-st","uf-barst"].forEach(function(id){
-        var el=document.getElementById(id); if(el&&el.textContent===msg) el.textContent="";
-      });
-    },3000);
-  }
-
-  // Like setSt but does NOT auto-clear — used for failures so the user
-  // can't miss them. Clears only when the next setSt/setStPersist call happens.
-  function setStPersist(msg, color){
-    ["uf-st","uf-barst"].forEach(function(id){
-      var el=document.getElementById(id); if(!el) return;
-      el.textContent=msg; el.style.color=color||"#cc0000";
-    });
-  }
-
-  // Switch to the Scripts tab so the user actually sees the error,
-  // regardless of which tab they were on when the save happened.
-  function focusScriptsTab(){
-    var tab = document.querySelector("[data-tab='scripts']");
-    var sec = document.getElementById("uf-tab-scripts");
-    if(!tab || !sec) return;
-    document.querySelectorAll(".uf-tab").forEach(function(t){t.classList.remove("on");});
-    document.querySelectorAll(".uf-sec").forEach(function(s){s.classList.remove("on");});
-    tab.classList.add("on");
-    sec.classList.add("on");
-    var scroll = sec.querySelector(".uf-scroll");
-    if(scroll) scroll.scrollTop = 0;
-  }
-
-  function updateBar(){
-    var s=siteLoad(), si=getSites();
-    var cs=document.getElementById("uf-cnt-s"), csi=document.getElementById("uf-cnt-si");
-    if(cs) cs.textContent=s.length+" script"+(s.length!==1?"s":"");
-    if(csi) csi.textContent=si.length+" site"+(si.length!==1?"s":"");
-  }
-
-  function renderScripts(){
-    var c=document.getElementById("uf-slist"); if(!c) return;
-    while(c.firstChild) c.removeChild(c.firstChild);
-    var arr=siteLoad();
-    if(!arr.length){
-      var em=document.createElement("div"); em.className="uf-empty";
-      em.textContent="No scripts yet."; c.appendChild(em); return;
-    }
-    arr.forEach(function(s,i){
-      var row=document.createElement("div"); row.className="uf-srow";
-      row.setAttribute("data-name", s.name);
-
-      // Checkbox
-      var lbl=document.createElement("label"); lbl.className="uf-cb";
-      var cb=document.createElement("input"); cb.type="checkbox"; cb.checked=!!s.enabled;
-      var box=document.createElement("span"); box.className="box";
-      lbl.appendChild(cb); lbl.appendChild(box);
-
-      // Info
-      var info=document.createElement("div"); info.className="uf-sinfo";
-      var nm=document.createElement("div"); nm.className="uf-sname"+(s.enabled?"":" dim"); nm.textContent=s.name;
-      var dm=document.createElement("div"); dm.className="uf-sdomain"; dm.textContent=s.domain||"(no domain)";
-      info.appendChild(nm); info.appendChild(dm);
-
-      // Push status
-      var pst=document.createElement("span"); pst.className="uf-push-st";
-
-      cb.onchange=(function(idx,nmEl,pstEl){ return function(){
-        var checked=this.checked;
-        cb.disabled=true;
-        var a=siteLoad(); a[idx].enabled=checked; siteSave(a);
-        nmEl.className="uf-sname"+(checked?"":" dim");
-        pstEl.textContent="pushing\u2026";
-        pushForDomain(a[idx].domain, a, function(ok){
-          cb.disabled=false;
-          pstEl.textContent=ok?"synced \u2713":"failed";
-          pstEl.style.color=ok?"green":"#900";
-          updateBar();
-        });
-      }; })(i,nm,pst);
-
-      // Edit
-      var eb=document.createElement("button"); eb.className="uf-btn"; eb.textContent="Edit";
-      eb.style.width="50px";
-      eb.onclick=(function(sc){ return function(){
-        _editingName=sc.name;
-        document.getElementById("uf-nameF").value=sc.name;
-        document.getElementById("uf-domF").value=sc.domain||"";
-        document.getElementById("uf-codeF").value=sc.code;
-        document.getElementById("uf-saveBtn").textContent="Update";
-        document.getElementById("uf-cancelEdit").style.display="";
-        document.querySelectorAll(".uf-tab").forEach(function(t){t.classList.remove("on");});
-        document.querySelectorAll(".uf-sec").forEach(function(s){s.classList.remove("on");});
-        document.querySelector("[data-tab='scripts']").classList.add("on");
-        document.getElementById("uf-tab-scripts").classList.add("on");
-        document.getElementById("uf-tab-scripts").querySelector(".uf-scroll").scrollTop=0;
-        document.getElementById("uf-nameF").focus();
-      }; })(s);
-
-      // Delete — optimistic: remove locally immediately, push in background
-      var db=document.createElement("button"); db.className="uf-btn danger"; db.textContent="Delete";
-      db.style.cssText="width:50px;text-align:center";
-      db.onclick=(function(idx,name,domain){ return function(){
-        if(!confirm("Delete \""+name+"\"?")) return;
-        var a=siteLoad(); a.splice(idx,1); siteSave(a);
-        renderScripts(); updateBar();
-        pushForDomain(domain, a, function(ok){
-          if(!ok) setSt("Deleted locally; remote push failed","#900");
-        });
-      }; })(i,s.name,s.domain);
-
-      row.appendChild(lbl); row.appendChild(info); row.appendChild(pst); row.appendChild(eb); row.appendChild(db);
-      c.appendChild(row);
-    });
-  }
-
-  function wireSettings(){
-    var domF=document.getElementById("uf-domF");
-    if(_referrer) domF.value=_referrer;
-
-    document.querySelectorAll(".uf-tab").forEach(function(tab){
-      tab.addEventListener("click",function(){
-        document.querySelectorAll(".uf-tab").forEach(function(t){t.classList.remove("on");});
-        document.querySelectorAll(".uf-sec").forEach(function(s){s.classList.remove("on");});
-        tab.classList.add("on");
-        var sec=document.getElementById("uf-tab-"+tab.getAttribute("data-tab"));
-        if(sec) sec.classList.add("on");
-      });
-    });
-
-    document.getElementById("uf-cancelEdit").addEventListener("click",function(){
-      _editingName=null;
-      document.getElementById("uf-nameF").value="My Script";
-      document.getElementById("uf-domF").value=_referrer||"";
-      document.getElementById("uf-codeF").value="";
-      document.getElementById("uf-saveBtn").textContent="Save Script";
-      document.getElementById("uf-cancelEdit").style.display="none";
-      setSt("","");
-    });
-
-    document.getElementById("uf-saveBtn").addEventListener("click",function(){
-      var name=(document.getElementById("uf-nameF").value.trim())||"My Script";
-      var domain=document.getElementById("uf-domF").value.trim();
-      var code=normalizeScriptCode(document.getElementById("uf-codeF").value.trim());
-      if(!code){ setSt("Code is required.","#900"); return; }
-
-      var arr=siteLoad(), idx=-1;
-      if(_editingName) arr.forEach(function(s,i){ if(s.name===_editingName) idx=i; });
-      var entry={name:name,domain:domain,code:code,enabled:true};
-      var candidate=arr.slice();
-      if(idx>=0) candidate[idx]=entry; else candidate.push(entry);
-
-      var saveBtn=document.getElementById("uf-saveBtn");
-      saveBtn.disabled=true;
-
-      function commit(){
-        siteSave(candidate);
-        _editingName=null;
-        saveBtn.textContent="Save Script";
-        saveBtn.disabled=false;
-        document.getElementById("uf-cancelEdit").style.display="none";
-        document.getElementById("uf-nameF").value="My Script";
-        document.getElementById("uf-codeF").value="";
-        document.getElementById("uf-domF").value=_referrer||"";
-        renderScripts(); updateBar();
-      }
-
-      if(!domain){
-        // Nothing to verify against — safe to save locally right away
-        commit();
-        return;
-      }
-
-      // Don't persist until the push to the target site actually succeeds.
-      // If the site blocks script execution (CSP) or can't be reached, the
-      // script never gets committed — so it never shows as "saved" when it
-      // wouldn't actually run.
-      setSt("Verifying "+domain+"\u2026","#777");
-      pushForDomain(domain, candidate, function(ok){
-        saveBtn.disabled=false;
-        if(ok) commit();
-        // On failure, pushForDomain already shows a persistent error message
-        // and switches to the Scripts tab. Form stays filled so nothing is lost.
-      });
-    });
-
-    document.getElementById("uf-update").addEventListener("click",function(){
-      var sites=getSites(), scripts=siteLoad();
-      if(!sites.length){ setSt("No tracked sites.","#777"); return; }
-      var rem=sites.length, failed=0;
-      setSt("Updating "+rem+" site(s)\u2026","#777");
-      sites.forEach(function(origin){
-        var toSend=scripts.filter(function(s){ return !s.domain||domainMatchesOrigin(s.domain,origin); });
-        pushToSite(origin,toSend,function(err){
-          rem--; if(err) failed++;
-          if(rem<=0){
-            if(failed===0) setSt("All updated \u2713","green");
-            else setSt(failed+" failed","#900");
-          }
-        });
-      });
-    });
-
-    renderScripts(); updateBar();
-    highlightRequestedScript();
-  }
-
-  // Called from the quick menu's "View in Settings" button — jumps to the
-  // Scripts tab, scrolls the matching row into view, and flashes it so
-  // it's obvious which script was meant.
-  function highlightRequestedScript(){
-    var params = new URLSearchParams(location.search);
-    var target = params.get("highlight");
-    if(!target) return;
-
-    document.querySelectorAll(".uf-tab").forEach(function(t){t.classList.remove("on");});
-    document.querySelectorAll(".uf-sec").forEach(function(s){s.classList.remove("on");});
-    var tab = document.querySelector("[data-tab='scripts']");
-    var sec = document.getElementById("uf-tab-scripts");
-    if(tab) tab.classList.add("on");
-    if(sec) sec.classList.add("on");
-
-    var rows = document.querySelectorAll(".uf-srow");
-    for(var i=0;i<rows.length;i++){
-      if(rows[i].getAttribute("data-name") !== target) continue;
-      var row = rows[i];
-      row.scrollIntoView({ block:"center" });
-      row.style.transition = "background .3s";
-      row.style.background = "#fbecec";
-      setTimeout(function(){ row.style.background = ""; }, 1600);
-      break;
-    }
-  }
-
-  // ── pushForDomain ─────────────────────────────────────────────────
-  function pushForDomain(domain, arr, cb){
-    if(!domain){
-      setSt("Saved (no domain \u2014 not pushed)","#777");
-      if(cb) cb(false); return;
-    }
-    var raw=stripWww(stripProtocol(domain.split(",")[0].trim().replace(/^\*\./,"")));
-    var sl=raw.indexOf("/"); if(sl!==-1) raw=raw.slice(0,sl);
-    if(!raw){ setSt("Saved","#777"); if(cb) cb(false); return; }
-
-    // Find tracked origins matching this domain (www-insensitive)
-    var known=getSites().filter(function(o){
-      try{ return stripWww(new URL(o).hostname)===raw; }catch(e){ return false; }
-    });
-    // First time: open one tab without www — window.name survives any redirect
-    var origins=known.length ? known : ["https://"+raw];
-
-    var rem=origins.length, failed=0, anyOk=false, errMsgs=[];
-    setSt("Pushing to "+raw+"\u2026","#777");
-    origins.forEach(function(origin){
-      var toSend=arr.filter(function(s){ return !s.domain||domainMatchesOrigin(s.domain,origin); });
-      pushToSite(origin, toSend, function(err){
-        rem--;
-        if(err){ failed++; errMsgs.push(err); }
-        else{ anyOk=true; addSite(origin); updateBar(); }
-        if(rem<=0){
-          if(anyOk){
-            setSt("Saved \u2713","green");
-          } else {
-            // Clear, persistent failure message — doesn't auto-clear like normal status
-            var reason = errMsgs[0]||"unknown error";
-            var human = reason.indexOf("CSP")!==-1
-              ? raw+" blocks script execution \u2014 this won't run there"
-              : reason==="timeout"
-                ? "Could not reach "+raw+" (timed out)"
-                : reason==="blocked"
-                  ? "Popup blocked \u2014 allow popups for google.com"
-                  : "Failed to save to "+raw;
-            setStPersist("\u2717 Not saved: "+human,"#cc0000");
-            focusScriptsTab();
-          }
-          if(cb) cb(anyOk);
-        }
-      });
-    });
-  }
-
-  // ── Boot ──────────────────────────────────────────────────────────
-  if(IS_BRIDGE){
-    // This tab's only job is to receive a bridge message and ack it — the
-    // overlay IIFE above already handles showing the "Saving…" screen.
-    // Booting the real settings UI here would wipe that overlay out from
-    // under it (bootSettingsPage clears the whole document), and there's
-    // nothing for runSiteScripts to usefully do on a tab that's about to
-    // close itself in well under a second either way.
-  } else if(IS_SETTINGS){
-    if(document.readyState==="loading")
-      document.addEventListener("DOMContentLoaded",bootSettingsPage);
-    else bootSettingsPage();
-  } else {
-    if(document.readyState==="loading")
-      document.addEventListener("DOMContentLoaded",runSiteScripts);
-    else runSiteScripts();
-  }
-
-  // ── UI helpers (modal, toast, style hardening) ─────────────────────
-  // Shared by the quick menu, Run JavaScript panel, and Save Script flow.
-  // Everything here is self-contained inline styles since it can appear on
-  // any arbitrary site — never relies on external CSS classes.
+  // ── UI helpers (generic modal, toast, style hardening) ─────────────
+  // Everything here is self-contained since it can appear on any
+  // arbitrary site — never relies on external CSS classes.
   var UF_ICON = "https://raw.githubusercontent.com/StudioCompile/uFeatures/main/Logo.png";
   var _modalEl = null;
   var _modalFilterRestore = null;
@@ -1559,12 +814,6 @@
     backdrop.style.cssText = "position:fixed;top:0;left:0;width:100%;height:100%;z-index:2147483646;background:rgba(0,0,0,.5);display:flex;align-items:center;justify-content:center";
     backdrop.addEventListener("click", closeModal);
 
-    // Same card look as Settings — #fff on #d8d8d8, no radius (square
-    // corners), 1px outline, no shadow. Centered via the backdrop's flexbox
-    // instead of position:fixed + transform:translate(-50%,-50%) — that
-    // transform-based approach lands the panel on non-integer sub-pixel
-    // coordinates, which makes hairline 1px borders render blurry/doubled.
-    // Flex centering keeps everything pixel-aligned so borders stay crisp.
     var panel = document.createElement("div");
     panel.style.cssText = [
       "position:relative;z-index:2147483647",
@@ -1580,8 +829,6 @@
     logoImg.src = UF_ICON;
     logoImg.setAttribute("width","18");
     logoImg.setAttribute("height","18");
-    // Same styling as the settings-page topbar logo — object-fit:contain
-    // plus image-rendering:auto, no extra border/outline treatment.
     logoImg.style.cssText = "width:18px;height:18px;object-fit:contain;image-rendering:auto;flex-shrink:0";
     var titleEl = document.createElement("span");
     titleEl.textContent = titleText;
@@ -1634,8 +881,8 @@
     }, 3000);
   }
 
-  // Shared field builders for modal forms — same colors/outlines as the
-  // Settings inputs (border #cfcfcf, focus #7f0000, radius 3px).
+  // Shared field builders for modal forms — border #cfcfcf, focus #7f0000,
+  // radius 3px, same as everything else in the popup.
   function ufLabel(text){
     var l = document.createElement("div");
     l.textContent = text;
@@ -1659,8 +906,6 @@
     t.onblur  = function(){ this.style.borderColor="#cfcfcf"; };
     return t;
   }
-  // Buttons: same colors as Settings' .uf-btn/.uf-btn.prim, but square —
-  // no border-radius on any popup button.
   function ufRedButton(label){
     var b = document.createElement("button");
     b.textContent = label;
@@ -1678,7 +923,92 @@
     return b;
   }
 
-  // ── Quick menu (Ctrl+`) ────────────────────────────────────────────
+  // ── Run JavaScript modal ────────────────────────────────────────────
+  // Run it once, or save it as a permanent script for THIS site — which
+  // just writes straight into this origin's own localStorage.
+  function openRunJsModal(){
+    var body = document.createElement("div");
+    body.style.cssText = "padding:12px";
+
+    body.appendChild(ufLabel("JavaScript"));
+    var codeField = ufTextarea();
+    body.appendChild(codeField);
+
+    var actionRow = document.createElement("div");
+    actionRow.style.cssText = "display:flex;gap:8px";
+
+    var runBtn = ufRedButton("Run Once");
+    runBtn.onclick = function(){
+      var code = normalizeScriptCode(codeField.value.trim());
+      if(!code) return;
+      closeModal();
+      try{ new Function(code)(); }
+      catch(err){ showToast("Error: "+err, "#cc0000"); }
+    };
+
+    var toSaveBtn = ufPlainButton("Save as Script");
+
+    actionRow.appendChild(runBtn);
+    actionRow.appendChild(toSaveBtn);
+    body.appendChild(actionRow);
+
+    var saveStep = document.createElement("div");
+    saveStep.style.cssText = "display:none";
+
+    saveStep.appendChild(ufLabel("Script name"));
+    var nameField = ufInput("My Script");
+    saveStep.appendChild(nameField);
+
+    var saveRow = document.createElement("div");
+    saveRow.style.cssText = "display:flex;gap:8px";
+
+    var backBtn = ufPlainButton("Back");
+    backBtn.onclick = function(){
+      saveStep.style.display = "none";
+      actionRow.style.display = "flex";
+    };
+
+    var confirmSaveBtn = ufRedButton("Save");
+    confirmSaveBtn.onclick = function(){
+      var code = normalizeScriptCode(codeField.value.trim());
+      var name = nameField.value.trim()||"My Script";
+      if(!code) return;
+      var entry = { name:name, domain:stripWww(location.hostname), code:code, enabled:true };
+
+      var arr = siteLoad();
+      var idx = -1;
+      for(var i=0;i<arr.length;i++){ if(arr[i].name===entry.name){ idx=i; break; } }
+      if(idx>=0) arr[idx]=entry; else arr.push(entry);
+      siteSave(arr);
+
+      closeModal();
+      showToast("Script saved \u2713 \u2014 refresh this page to run it", "#1e7e34");
+    };
+
+    saveRow.appendChild(backBtn);
+    saveRow.appendChild(confirmSaveBtn);
+    saveStep.appendChild(saveRow);
+    body.appendChild(saveStep);
+
+    toSaveBtn.onclick = function(){
+      actionRow.style.display = "none";
+      saveStep.style.display = "block";
+      nameField.focus();
+      nameField.select();
+    };
+
+    openModal("Run JavaScript", body, 400);
+    codeField.focus();
+  }
+
+  // ════════════════════════════════════════════════════════════════════
+  // QUICK MENU  —  the Ctrl+` popup (per-site)
+  // ════════════════════════════════════════════════════════════════════
+  // Built on the openModal()/ufInput()/ufRedButton() shell that was
+  // already in the script. Everything it lists and edits comes from THIS
+  // origin's own localStorage via siteLoad/siteSave — the same list
+  // runSiteScripts() reads on page load — so there's nothing to sync.
+
   function openQuickMenu(){
     var list = document.createElement("div");
     list.style.cssText = "display:flex;flex-direction:column;padding:6px 6px 0";
@@ -1702,15 +1032,9 @@
       list.appendChild(btn);
     }
 
-    addItem("Settings", function(){
-      window.open("https://www.google.com/ufeatures","_blank");
-    });
-    addItem("Inspect Element", function(){
-      injectChii();
-    });
-    addItem("Run JavaScript", function(){
-      openRunJsModal();
-    });
+    addItem("Script Manager", function(){ openScriptsModal(); });
+    addItem("Inspect Element", function(){ injectChii(); });
+    addItem("Run JavaScript", function(){ openRunJsModal(); });
 
     var wrap = document.createElement("div");
     wrap.appendChild(list);
@@ -1722,8 +1046,9 @@
     var summaryRow = document.createElement("div");
     summaryRow.style.cssText = "padding:6px 0;text-align:center";
 
+    var n = _ufRunningScripts.length;
     var summary = document.createElement("span");
-    summary.textContent = "1 script";
+    summary.textContent = n+" script"+(n!==1?"s":"")+" running on "+stripWww(location.hostname);
     summary.style.cssText = [
       "display:inline-block",
       "font-size:10px;color:#888",
@@ -1737,22 +1062,372 @@
       e.stopPropagation();
       openRunningScriptsModal();
     };
+
+    var bullet = document.createElement("span");
+    bullet.textContent = "\u2022";
+    bullet.style.cssText = "display:inline-block;font-size:13px;color:#888;line-height:1;margin:0 6px";
+
+    var infoLink = document.createElement("span");
+    infoLink.textContent = "Info";
+    infoLink.style.cssText = summary.style.cssText;
+    infoLink.onmouseover = summary.onmouseover;
+    infoLink.onmouseout  = summary.onmouseout;
+    infoLink.onclick = function(e){
+      e.stopPropagation();
+      openInfoModal();
+    };
+
     summaryRow.appendChild(summary);
+    summaryRow.appendChild(bullet);
+    summaryRow.appendChild(infoLink);
     wrap.appendChild(summaryRow);
 
     openModal("uFeatures", wrap, 400);
   }
 
+  // ── Info modal ──────────────────────────────────────────────────────
+  // The "About" content that used to live on the google.com/ufeatures
+  // Home tab, now reachable from the quick menu instead of a separate page.
+  var UF_FEATURES = [
+    { title:"Script Manager", desc:"Save JavaScript snippets that run automatically on this site every page load. Edit, toggle, or delete from the popup." },
+    { title:"Remove Securly Loading", desc:"Removes Securly overlay elements on load and watches via MutationObserver so they cannot come back." },
+    { title:"Inspect Element", desc:"Injects a remote DevTools panel into any page. Ctrl+Shift+I to toggle." },
+    { title:"Bookmarklet Runner", desc:"Copy any javascript: URL then press Ctrl+V outside a text field to run it on the current page." },
+    { title:"Iframe Navigator", desc:"Hover the bottom-right corner of any iframe to navigate it to a new URL." }
+  ];
+
+  // A collapsed-by-default <details>-style section with our own arrow
+  // glyph in place of the native marker (which varies by browser), used
+  // for both Features and Shortcuts below.
+  function ufSection(label){
+    var wrap = document.createElement("div");
+    wrap.style.cssText = "margin-top:8px;border-top:1px solid #d8d8d8;padding-top:8px";
+
+    var head = document.createElement("div");
+    head.style.cssText = "display:flex;align-items:center;gap:5px;cursor:pointer;user-select:none;font-size:11px;font-weight:600;color:#6f6e77;text-transform:uppercase;letter-spacing:.05em";
+    var arrow = document.createElement("span");
+    arrow.textContent = "\u25B6";
+    arrow.style.cssText = "display:inline-block;transition:transform .15s;font-size:9px";
+    var lbl = document.createElement("span");
+    lbl.textContent = label;
+    head.appendChild(arrow); head.appendChild(lbl);
+
+    var content = document.createElement("div");
+    content.style.cssText = "display:none;margin-top:8px";
+
+    var open = false;
+    head.onclick = function(){
+      open = !open;
+      content.style.display = open ? "block" : "none";
+      arrow.style.transform = open ? "rotate(90deg)" : "rotate(0deg)";
+    };
+
+    wrap.appendChild(head);
+    wrap.appendChild(content);
+    return { wrap:wrap, content:content };
+  }
+
+  // Slideshow: one feature card at a time, arrows either side plus a dot
+  // row, so the popup only ever grows tall enough for a single card.
+  function buildFeatureSlideshow(){
+    var idx = 0;
+    var slides = UF_FEATURES;
+
+    var box = document.createElement("div");
+    box.style.cssText = "display:flex;align-items:center;gap:8px";
+
+    function arrowBtn(glyph){
+      var b = document.createElement("button");
+      b.textContent = glyph;
+      b.style.cssText = "flex-shrink:0;width:22px;height:22px;padding:0;border:1px solid #cfcfcf;border-radius:3px;background:#fff;color:#6f6e77;font-size:12px;cursor:pointer";
+      b.onmouseover = function(){ this.style.background="#f0f0f0"; };
+      b.onmouseout  = function(){ this.style.background="#fff"; };
+      return b;
+    }
+    var prevBtn = arrowBtn("\u2039");
+    var nextBtn = arrowBtn("\u203A");
+
+    var card = document.createElement("div");
+    card.style.cssText = "flex:1;min-width:0;min-height:64px;padding:8px 4px";
+    var cardTitle = document.createElement("div");
+    cardTitle.style.cssText = "font-size:13px;font-weight:600;color:#1c1b22;margin-bottom:4px";
+    var cardDesc = document.createElement("div");
+    cardDesc.style.cssText = "font-size:12px;color:#555;line-height:1.5";
+    card.appendChild(cardTitle); card.appendChild(cardDesc);
+
+    var dots = document.createElement("div");
+    dots.style.cssText = "display:flex;justify-content:center;gap:5px;margin-top:4px;flex-wrap:wrap";
+    var dotEls = slides.map(function(_, i){
+      var d = document.createElement("span");
+      d.style.cssText = "width:6px;height:6px;border-radius:50%;background:#d8d8d8;cursor:pointer;display:inline-block";
+      d.onclick = function(){ idx=i; render(); };
+      dots.appendChild(d);
+      return d;
+    });
+
+    function render(){
+      cardTitle.textContent = slides[idx].title;
+      cardDesc.textContent = slides[idx].desc;
+      dotEls.forEach(function(d,i){ d.style.background = i===idx ? "#7f0000" : "#d8d8d8"; });
+    }
+    prevBtn.onclick = function(){ idx = (idx-1+slides.length)%slides.length; render(); };
+    nextBtn.onclick = function(){ idx = (idx+1)%slides.length; render(); };
+    render();
+
+    box.appendChild(prevBtn);
+    box.appendChild(card);
+    box.appendChild(nextBtn);
+
+    var outer = document.createElement("div");
+    outer.appendChild(box);
+    outer.appendChild(dots);
+    return outer;
+  }
+
+  function openInfoModal(){
+    var body = document.createElement("div");
+    body.style.cssText = "padding:12px 16px 14px";
+
+    var byline = document.createElement("div");
+    byline.style.cssText = "font-size:11px;color:#aaa;margin-bottom:10px";
+    byline.innerHTML = "By StudioCompile &mdash; Roblox: studiocompile &middot; Discord: @roblox_studio";
+    body.appendChild(byline);
+
+    var intro = document.createElement("div");
+    intro.style.cssText = "font-size:13px;color:#444;line-height:1.55";
+    intro.textContent = "uBlock Origin lets you inject JS into almost any website, which has a lot of potential. There are already projects out there for it, but you can only add one at a time and most aren't great. uFeatures is a great way to add all of these features \u2014 and easily add even more.";
+    body.appendChild(intro);
+
+    var featSec = ufSection("Features");
+    featSec.content.appendChild(buildFeatureSlideshow());
+    body.appendChild(featSec.wrap);
+
+    var footer = document.createElement("div");
+    footer.style.cssText = "display:flex;margin-top:14px";
+    var backBtn = ufPlainButton("Back");
+    backBtn.onclick = function(){ closeModal(); openQuickMenu(); };
+    footer.appendChild(backBtn);
+    body.appendChild(footer);
+
+    openModal("uFeatures", body, 380);
+  }
+
+  // ── Scripts list ────────────────────────────────────────────────────
+  // Same row layout/colors as the old Settings "Saved Scripts" card, but
+  // scoped to this site only. Checkbox is hand-built from spans since this
+  // renders on arbitrary pages with no stylesheet of our own to lean on.
+  function openScriptsModal(){
+    var body = document.createElement("div");
+    body.style.cssText = "padding:0 10px";
+
+    var card = document.createElement("div");
+    card.style.cssText = "border:1px solid #d8d8d8;border-radius:4px;overflow:hidden;margin:10px 0";
+    body.appendChild(card);
+
+    var arr = siteLoad();
+
+    if(!arr.length){
+      var empty = document.createElement("div");
+      empty.textContent = "No scripts saved for this site yet.";
+      empty.style.cssText = "padding:24px;text-align:center;color:#bbb;font-size:13px;background:#fff";
+      card.appendChild(empty);
+    } else {
+      arr.forEach(function(s, i){
+        var row = document.createElement("div");
+        row.style.cssText = [
+          "display:grid;grid-template-columns:16px 1fr 46px 60px",
+          "align-items:center;gap:9px;padding:8px 12px;background:#fff",
+          i<arr.length-1 ? "border-bottom:1px solid #ececec" : ""
+        ].join(";");
+
+        // Checkbox — 16px, red when checked, white checkmark
+        var cb = document.createElement("span");
+        cb.style.cssText = "position:relative;width:16px;height:16px;flex-shrink:0;cursor:pointer;display:block;border:1px solid #cfcfcf;border-radius:0;background:#fff";
+        var tick = document.createElement("span");
+        tick.style.cssText = "position:absolute;left:4px;top:1px;width:6px;height:9px;border:2px solid #fff;border-top:none;border-left:none;transform:rotate(45deg)";
+        cb.appendChild(tick);
+
+        var name = document.createElement("div");
+        name.style.cssText = "font-size:13px;color:#1c1b22;overflow:hidden;text-overflow:ellipsis;white-space:nowrap";
+        name.textContent = s.name;
+
+        function paint(on){
+          cb.style.background = on ? "#7f0000" : "#fff";
+          cb.style.borderColor = on ? "#7f0000" : "#cfcfcf";
+          tick.style.display = on ? "block" : "none";
+          name.style.color = on ? "#1c1b22" : "#bbb";
+        }
+        paint(!!s.enabled);
+
+        cb.onclick = (function(idx){ return function(e){
+          e.stopPropagation();
+          var a = siteLoad();
+          a[idx].enabled = !a[idx].enabled;
+          siteSave(a);
+          paint(a[idx].enabled);
+        }; })(i);
+
+        var info = document.createElement("div");
+        info.style.cssText = "min-width:0";
+        var dom = document.createElement("div");
+        dom.style.cssText = "font-size:11px;color:#999;overflow:hidden;text-overflow:ellipsis;white-space:nowrap";
+        dom.textContent = !s.domain ? "(no domain \u2014 won't run)"
+          : s.domain.indexOf("/")===-1 ? "Every page"
+          : "Only "+s.domain.slice(s.domain.indexOf("/"));
+        info.appendChild(name);
+        info.appendChild(dom);
+
+        function smallBtn(label, danger, width){
+          var b = document.createElement("button");
+          b.textContent = label;
+          b.style.cssText = "width:"+(width||46)+"px;padding:4px 0;font-size:11px;font-family:inherit;cursor:pointer;border:1px solid #cfcfcf;background:#fff;border-radius:0;color:"+(danger?"#7f0000":"#1c1b22");
+          b.onmouseover = function(){ this.style.background = danger?"#fbecec":"#f0f0f0"; };
+          b.onmouseout  = function(){ this.style.background = "#fff"; };
+          return b;
+        }
+
+        var eb = smallBtn("Edit", false, 46);
+        eb.onclick = (function(sc){ return function(e){
+          e.stopPropagation();
+          openScriptEditor(sc);
+        }; })(s);
+
+        var db = smallBtn("Delete", true, 60);
+        db.onclick = (function(idx, nm){ return function(e){
+          e.stopPropagation();
+          var a = siteLoad();
+          a.splice(idx,1);
+          siteSave(a);
+          openScriptsModal();
+          showToast("Deleted \""+nm+"\"", "#7f0000");
+        }; })(i, s.name);
+
+        row.appendChild(cb);
+        row.appendChild(info);
+        row.appendChild(eb);
+        row.appendChild(db);
+        card.appendChild(row);
+      });
+    }
+
+    var footer = document.createElement("div");
+    footer.style.cssText = "display:flex;gap:8px;padding:0 0 10px";
+    var backBtn = ufPlainButton("Back");
+    backBtn.onclick = function(){ closeModal(); openQuickMenu(); };
+    var newBtn = ufRedButton("New Script");
+    newBtn.onclick = function(){ openScriptEditor(null); };
+    footer.appendChild(backBtn);
+    footer.appendChild(newBtn);
+    body.appendChild(footer);
+
+    openModal("My Scripts", body, 400);
+  }
+
+  // ── Script editor ───────────────────────────────────────────────────
+  // The Domain field is the "sensitivity" dial: plain hostname runs
+  // everywhere on this site, "*.host" also catches subdomains, and
+  // "host/some/path" restricts it to one section. Defaults to the current
+  // hostname so the common case needs no thought.
+  function openScriptEditor(existing){
+    var host = stripWww(location.hostname);
+    var body = document.createElement("div");
+    body.style.cssText = "padding:12px";
+
+    body.appendChild(ufLabel("Script name"));
+    var nameField = ufInput(existing ? existing.name : "My Script");
+    body.appendChild(nameField);
+
+    body.appendChild(ufLabel("Domain"));
+
+    // Existing entries with a path suffix (host+"/foo") come back with
+    // that path pre-filled; a bare host (or nothing yet) means "whole
+    // domain", so the path side starts empty.
+    var existingPath = "";
+    if(existing && existing.domain){
+      var slash = existing.domain.indexOf("/");
+      if(slash!==-1) existingPath = existing.domain.slice(slash);
+    }
+
+    var domRow = document.createElement("div");
+    domRow.style.cssText = "display:flex;align-items:stretch;border:1px solid #cfcfcf;border-radius:3px;overflow:hidden;margin-bottom:6px";
+
+    var domPrefix = document.createElement("div");
+    domPrefix.textContent = host;
+    domPrefix.title = "This can't be changed \u2014 a script saved here only ever runs on "+host;
+    domPrefix.style.cssText = "padding:6px 0 6px 8px;background:#fff;color:#1c1b22;font-family:inherit;font-size:13px;white-space:nowrap";
+
+    var pathField = document.createElement("input");
+    pathField.type = "text";
+    pathField.value = existingPath;
+    pathField.placeholder = "/optional-path";
+    pathField.style.cssText = "border:none;flex:1;min-width:0;padding:6px 8px 6px 1px;font-family:inherit;font-size:13px;color:#1c1b22;background:#fff;outline:none";
+    pathField.onfocus = function(){ domRow.style.borderColor="#7f0000"; };
+    pathField.onblur  = function(){ domRow.style.borderColor="#cfcfcf"; };
+
+    domRow.appendChild(domPrefix);
+    domRow.appendChild(pathField);
+    body.appendChild(domRow);
+
+    var hint = document.createElement("div");
+    hint.style.cssText = "font-size:10px;color:#aaa;line-height:1.5;margin-bottom:8px";
+    hint.textContent = "Leave blank for all directories.";
+    body.appendChild(hint);
+
+    body.appendChild(ufLabel("JavaScript"));
+    var codeField = ufTextarea();
+    codeField.value = existing ? existing.code : "";
+    body.appendChild(codeField);
+
+    var row = document.createElement("div");
+    row.style.cssText = "display:flex;gap:8px";
+
+    var backBtn = ufPlainButton("Back");
+    backBtn.onclick = function(){ openScriptsModal(); };
+
+    var saveBtn = ufRedButton(existing ? "Update" : "Save Script");
+    saveBtn.onclick = function(){
+      var code = normalizeScriptCode(codeField.value.trim());
+      if(!code){ showToast("Code is required.", "#cc0000"); return; }
+      var path = pathField.value.trim();
+      if(path && path[0]!=="/") path = "/"+path;
+      var entry = {
+        name: nameField.value.trim()||"My Script",
+        domain: path ? host+path : host,
+        code: code,
+        enabled: existing ? existing.enabled !== false : true
+      };
+
+      var arr = siteLoad();
+      var key = existing ? existing.name : entry.name;
+      var idx = -1;
+      for(var i=0;i<arr.length;i++){ if(arr[i].name===key){ idx=i; break; } }
+      if(idx>=0) arr[idx]=entry; else arr.push(entry);
+      siteSave(arr);
+
+      openScriptsModal();
+      showToast("Saved \u2713 \u2014 refresh this page to run it", "#1e7e34");
+    };
+
+    row.appendChild(backBtn);
+    row.appendChild(saveBtn);
+    body.appendChild(row);
+
+    openModal(existing ? "Edit Script" : "New Script", body, 400);
+    nameField.focus();
+    nameField.select();
+  }
+
   // ── Running Scripts viewer ──────────────────────────────────────────
   // Shows exactly what runSiteScripts() executed on THIS page load — the
   // scripts that were enabled and matched this domain — with a mark for
-  // whether each one actually ran without throwing. Styled to match the
-  // Scripts list in Settings. Each row's "View" button opens Settings and
-  // scrolls straight to that script, highlighted, instead of letting you
-  // edit anything from here.
+  // whether each one actually ran without throwing. "Edit" jumps straight
+  // into that script's editor instead of a separate settings page.
   function openRunningScriptsModal(){
+    var body = document.createElement("div");
+
     var card = document.createElement("div");
-    card.style.cssText = "margin:10px;border:1px solid #d8d8d8;border-radius:4px;overflow:hidden;font-family:'Segoe UI',system-ui,-apple-system,sans-serif";
+    card.style.cssText = "margin:10px;border:1px solid #d8d8d8;border-radius:4px;overflow:hidden";
+    body.appendChild(card);
 
     if(!_ufRunningScripts.length){
       var empty = document.createElement("div");
@@ -1779,14 +1454,16 @@
         name.style.cssText = "font-size:13px;color:#1c1b22;overflow:hidden;text-overflow:ellipsis;white-space:nowrap";
 
         var viewBtn = document.createElement("button");
-        viewBtn.textContent = "View";
+        viewBtn.textContent = "Edit";
         viewBtn.style.cssText = "width:50px;padding:4px 0;font-size:12px;font-family:inherit;cursor:pointer;border:1px solid #cfcfcf;background:#fff;color:#1c1b22;border-radius:0";
         viewBtn.onmouseover = function(){ this.style.background="#f0f0f0"; };
         viewBtn.onmouseout  = function(){ this.style.background="#fff"; };
-        viewBtn.onclick = function(e){
+        viewBtn.onclick = (function(nm){ return function(e){
           e.stopPropagation();
-          window.open("https://www.google.com/ufeatures?highlight="+encodeURIComponent(s.name), "_blank");
-        };
+          var arr = siteLoad(), found = null;
+          for(var k=0;k<arr.length;k++){ if(arr[k].name===nm){ found=arr[k]; break; } }
+          if(found) openScriptEditor(found);
+        }; })(s.name);
 
         row.appendChild(dot);
         row.appendChild(name);
@@ -1795,157 +1472,14 @@
       });
     }
 
-    openModal("Running Scripts", card, 340);
-  }
-
-  // ── Run JavaScript modal ────────────────────────────────────────────
-  // Run it once, or save it as a permanent script for this site — which
-  // also pushes it into the master list on the settings page.
-  function openRunJsModal(){
-    var body = document.createElement("div");
-    body.style.cssText = "padding:12px";
-
-    body.appendChild(ufLabel("JavaScript"));
-    var codeField = ufTextarea();
-    body.appendChild(codeField);
-
-    // Initial actions: run it once, or move to naming it to save permanently
-    var actionRow = document.createElement("div");
-    actionRow.style.cssText = "display:flex;gap:8px";
-
-    var runBtn = ufRedButton("Run Once");
-    runBtn.onclick = function(){
-      var code = normalizeScriptCode(codeField.value.trim());
-      if(!code) return;
-      closeModal();
-      try{ new Function(code)(); }
-      catch(err){ showToast("Error: "+err, "#cc0000"); }
-    };
-
-    var toSaveBtn = ufPlainButton("Save as Script");
-
-    actionRow.appendChild(runBtn);
-    actionRow.appendChild(toSaveBtn);
-    body.appendChild(actionRow);
-
-    // Naming step: only shown once "Save as Script" is chosen
-    var saveStep = document.createElement("div");
-    saveStep.style.cssText = "display:none";
-
-    var nameLabel = ufLabel("Script name");
-    var nameField = ufInput("My Script");
-    saveStep.appendChild(nameLabel);
-    saveStep.appendChild(nameField);
-
-    var saveRow = document.createElement("div");
-    saveRow.style.cssText = "display:flex;gap:8px";
-
+    var footer = document.createElement("div");
+    footer.style.cssText = "display:flex;gap:8px;padding:0 10px 10px";
     var backBtn = ufPlainButton("Back");
-    backBtn.onclick = function(){
-      saveStep.style.display = "none";
-      actionRow.style.display = "flex";
-    };
+    backBtn.onclick = function(){ closeModal(); openQuickMenu(); };
+    footer.appendChild(backBtn);
+    body.appendChild(footer);
 
-    var confirmSaveBtn = ufRedButton("Save");
-    confirmSaveBtn.onclick = function(){
-      var code = normalizeScriptCode(codeField.value.trim());
-      var name = nameField.value.trim()||"My Script";
-      if(!code) return;
-      var entry = { name:name, domain:location.hostname, code:code, enabled:true };
-
-      // Save locally so it runs on THIS site immediately/from now on
-      var arr = siteLoad();
-      var idx = -1;
-      for(var i=0;i<arr.length;i++){ if(arr[i].name===entry.name){ idx=i; break; } }
-      if(idx>=0) arr[idx]=entry; else arr.push(entry);
-      siteSave(arr);
-
-      closeModal();
-
-      // Also push it into the master list on google.com so it shows up
-      // in Settings > My Scripts, same as saving it from there directly.
-      pushAppendToGoogle(entry, function(err){
-        if(err) showToast("Saved for this site, but couldn't sync to Settings", "#cc0000");
-        else showToast("Script saved \u2713 — refresh this page to run it", "#1e7e34");
-      });
-    };
-
-    saveRow.appendChild(backBtn);
-    saveRow.appendChild(confirmSaveBtn);
-    saveStep.appendChild(saveRow);
-    body.appendChild(saveStep);
-
-    toSaveBtn.onclick = function(){
-      actionRow.style.display = "none";
-      saveStep.style.display = "block";
-      nameField.focus();
-      nameField.select();
-    };
-
-    var panel = openModal("Run JavaScript", body, 400);
-    codeField.focus();
-  }
-
-  // Push a single script entry into google.com's master list without
-  // touching whatever else is already saved there.
-  function pushAppendToGoogle(entry, onDone){
-    var done=false, poll=null, timer=null;
-    var token = Math.random().toString(36).slice(2);
-    // IMPORTANT: this targets our OWN settings page, not Google's real
-    // search homepage. The bare homepage is a huge, unpredictable page we
-    // don't control — region redirects, consent screens, its own strict
-    // CSP — any of which can silently swallow the bridge tab and leave it
-    // stuck showing "Saving…" forever with no way to diagnose why. Our
-    // settings page is a page we fully control instead.
-    //
-    // location.pathname never includes the query string, so appending
-    // "?__ufb=1" here still leaves pathname exactly "/ufeatures" — IS_SETTINGS
-    // stays true, so the real settings UI renders. That's fine: the bridge
-    // message listener that handles uf_bridge_append is registered
-    // unconditionally (not gated by IS_SETTINGS), so it acks back exactly
-    // the same regardless of what's currently on screen in that tab.
-    var origin = "https://www.google.com/ufeatures";
-    // Unique every call — NOT the predictable "uf_bridge_<origin>" name used
-    // elsewhere for tab reuse. If this tab itself was ever previously used
-    // as a bridge tab for google.com (e.g. from an earlier Settings push)
-    // and then navigated elsewhere without closing, its window.name would
-    // still carry that old value. window.open(url, matchingName) navigates
-    // WHATEVER window currently has that name — including the calling tab
-    // itself — which would silently hijack/replace the page the user is
-    // actually on, and kill the very script that was waiting for a
-    // response (explaining a save that "just stays on saving" forever).
-    // A random suffix guarantees this always opens a fresh, separate tab.
-    var winName = "uf_bridge_append_" + Date.now() + "_" + token;
-
-    function finish(err){
-      if(done) return;
-      done = true;
-      clearInterval(poll); clearTimeout(timer);
-      window.removeEventListener("message", onMsg);
-      setTimeout(function(){ try{ tab && tab.close(); }catch(e){} }, 500);
-      if(onDone) onDone(err||null);
-    }
-    function onMsg(e){
-      var d = e.data;
-      if(!d || typeof d !== "object" || d.token !== token) return;
-      if(d.type === "uf_bridge_ack"){
-        finish(d.error ? "save-error:"+d.error : null);
-      }
-    }
-    window.addEventListener("message", onMsg);
-
-    var tab = window.open(origin + "?__ufb=1", winName);
-    if(!tab){
-      window.removeEventListener("message", onMsg);
-      if(onDone) onDone("blocked");
-      return;
-    }
-    poll = setInterval(function(){
-      if(done){ clearInterval(poll); return; }
-      if(tab.closed){ finish("closed"); return; }
-      try{ tab.postMessage({ type:"uf_bridge_append", key:SITE_KEY, entry:entry, token:token }, "*"); }catch(e){}
-    }, 60);
-    timer = setTimeout(function(){ if(!done) finish("timeout"); }, 5000);
+    openModal("Running Scripts", body, 340);
   }
 
   // ── Global shortcuts ──────────────────────────────────────────────
@@ -1960,7 +1494,7 @@
     }
     if(e.ctrlKey&&!e.shiftKey&&!e.altKey&&e.code==="Backquote"){
       e.preventDefault();
-      if(!IS_SETTINGS) window.open("https://www.google.com/ufeatures","_blank");
+      if(_modalEl) closeModal(); else openQuickMenu();
       return;
     }
     if(e.ctrlKey&&!e.shiftKey&&!e.altKey&&e.key==="v"){
