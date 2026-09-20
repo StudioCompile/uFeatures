@@ -191,6 +191,12 @@
       f.style.setProperty("left","0","important");
       f.style.setProperty("width","100vw","important");
       f.style.setProperty("height","100vh","important");
+      // Browsers that understand dvw/dvh (dynamic viewport units, which
+      // track the actual visible area rather than the space behind a
+      // mobile browser's address bar) override the vw/vh above; older
+      // browsers just ignore these as invalid and keep the vw/vh values.
+      f.style.setProperty("width","100dvw","important");
+      f.style.setProperty("height","100dvh","important");
       f.style.setProperty("z-index","2147483000","important");
     }
 
@@ -409,7 +415,7 @@
     style.textContent = [
       ":host{all:initial;--panel-width:"+_chiiWidth+"px}",
       "*{box-sizing:border-box}",
-      "#chii-resize-handle{position:fixed;top:0;right:var(--panel-width);width:5px;margin-right:-2px;height:100vh;cursor:col-resize;z-index:2147483647;background:transparent;touch-action:none;display:none;"+UF_STYLE_RESET+"}",
+      "#chii-resize-handle{position:fixed;top:0;right:var(--panel-width);width:5px;margin-right:-2px;height:100vh;height:100dvh;cursor:col-resize;z-index:2147483647;background:transparent;touch-action:none;display:none;"+UF_STYLE_RESET+"}",
       "#chii-resize-handle::after{content:'';position:absolute;top:0;left:2px;width:1px;height:100%;background:#474747}",
       "#chii-resize-handle.open{display:block}",
       // Guaranteed close button — lives here on the host side because
@@ -473,21 +479,6 @@
     if(_chiiResizeHandle) _chiiResizeHandle.classList.toggle("open", open);
   }
 
-  function _chiiMatchesFrame(node){
-    if(!node || node.tagName!=="IFRAME") return false;
-    var src = node.getAttribute("src")||"";
-    return src.indexOf("chii_app.html")!==-1;
-  }
-  function _chiiFindFrameIn(node){
-    if(!node || node.nodeType!==1) return null;
-    if(_chiiMatchesFrame(node)) return node;
-    if(node.querySelector){
-      var f = node.querySelector('iframe[src*="chii_app.html"]');
-      if(f) return f;
-    }
-    return null;
-  }
-
   function _chiiApplyDockedStyle(){
     if(!_chiiWrap || !_chiiFrame) return;
     // No sidebar reserved anymore — the panel occupies its full width,
@@ -498,7 +489,7 @@
       "position:fixed !important;top:0 !important;"+
       "right:0 !important;left:auto !important;bottom:auto !important;"+
       "width:"+_chiiWidth+"px !important;max-width:none !important;"+
-      "height:100vh !important;max-height:none !important;"+
+      "height:100vh !important;height:100dvh !important;max-height:none !important;"+
       "z-index:2147483647 !important;background:#282828 !important;overflow:hidden !important;"+
       "display:"+(_chiiHidden?"none":"block")+" !important;"+
       "margin:0 !important;padding:0 !important;border:none !important;transform:none !important;"+
@@ -705,20 +696,23 @@
 
     _chiiSetupHost();
 
-    var observer = new MutationObserver(function(mutations){
-      for(var i=0;i<mutations.length;i++){
-        var added = mutations[i].addedNodes;
-        for(var j=0;j<added.length;j++){
-          var frame = _chiiFindFrameIn(added[j]);
-          if(frame){
-            _chiiDockRight(frame);
-            observer.disconnect();
-            return;
-          }
-        }
-      }
-    });
-    observer.observe(document.body || document.documentElement, { childList:true, subtree:true });
+    // Build our own wrapper + iframe up front and hand the iframe to chii
+    // through its documented window.ChiiDevtoolsIframe hook, BEFORE
+    // loading target.js. Left to itself, chii creates its own bottom-
+    // docked panel (a fixed, half-screen-tall container appended to
+    // <body>) and shrinks document.body's own height to make room for
+    // it. We then redock the visible panel to the right side just fine,
+    // but that body-height shrink is never undone — the page's real
+    // background shows through as a bar at the bottom. Supplying our own
+    // iframe up front skips chii's panel and body-resize logic entirely:
+    // it just loads into the iframe we already control.
+    var wrap = document.createElement("div");
+    var frame = document.createElement("iframe");
+    wrap.appendChild(frame);
+    document.body.appendChild(wrap);
+    window.ChiiDevtoolsIframe = frame;
+
+    _chiiDockRight(frame);
 
     var s = document.createElement("script");
     s.setAttribute("embedded","true");
